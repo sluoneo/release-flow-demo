@@ -1,3 +1,3 @@
 # release-flow-demo
 
-Throwaway demo of the neos-ai tag-based release buttons, for screenshots. Workflows only echo.
+Throwaway demo of a tag-based release buttons, for screenshots. Workflows only echo.

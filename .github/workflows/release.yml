@@ -1,6 +1,6 @@
 # Deploy buttons: tag a commit uat-*/release-* and start main.yml on that tag; hotfix only opens a branch.
 # A GITHUB_TOKEN tag push starts no workflow, so each tag op dispatches main.yml on its new tag.
-# Rollback is not an op here: Actions → Main Workflow → Run workflow on the old release tag (prod, apply).
+# Rollback is not an op here: Actions → Build and Deploy → Run workflow on the old release tag (prod, apply).
 name: Release
 run-name: "${{ inputs.op }} ${{ inputs.sha }}${{ inputs.uat_tag }}${{ inputs.release_tag }}"
 
