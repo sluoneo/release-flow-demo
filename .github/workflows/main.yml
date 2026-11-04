@@ -1,0 +1,144 @@
+# AutoPilot: PR → CI + dev plan; push to main → CI + dev plan + dev apply. Tag uat-YYYY-MM-DD-N → uat,
+# release-YYYY-MM-DD-N → prod (after approval). Any well-formed tag deploys, old ones too.
+name: Main Workflow
+
+# Run title: "<env> · <mode> · <source>", e.g.
+#   dev  · plan (dry-run) 🔍 · PR #123 feat: widget
+#   prod · plan, APPLY on approval 🚀 · tag release-2026-10-14-1
+# No actor — GitHub already renders it next to every run in the list.
+# run-name may only read the github/inputs/vars contexts (no env/needs/steps) and
+# GHA expressions cannot truncate, so the commit subject is not available here —
+# resolve-environment publishes it and deploy.yml's job summary carries it instead.
+# Job names deliberately stay stable so status checks can attach to them.
+# Tag refs come first so release.yml's dispatch on a tag is titled like that tag's push.
+run-name: >-
+  ${{ startsWith(github.ref, 'refs/tags/release-')
+      && format('prod · plan, APPLY on approval 🚀 · tag {0}', github.ref_name)
+      || startsWith(github.ref, 'refs/tags/uat-')
+      && format('uat · APPLY 🚀 · tag {0}', github.ref_name)
+      || github.event_name == 'push'
+      && 'dev · APPLY 🚀 · push to main'
+      || github.event_name == 'workflow_dispatch'
+      && format('{0} · {1} · manual on {2}',
+                inputs.environment,
+                (inputs.apply_changes == true || inputs.apply_changes == 'true') && 'APPLY 🚀' || 'plan (dry-run) 🔍',
+                github.ref_name)
+      || format('dev · plan (dry-run) 🔍 · PR #{0} {1}',
+                github.event.pull_request.number,
+                github.event.pull_request.title) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (apply only for dev/sandbox; uat and prod apply from their tags)
+        required: true
+        type: choice
+        options:
+          - dev
+          - uat
+          - prod
+          - sandbox
+        default: dev
+      apply_changes:
+        description: "Apply changes (uncheck for plan only / dry run)"
+        required: true
+        type: boolean
+        default: false
+
+  # main: CI re-runs on the merged result, then dev applies. Tag globs only route; resolve
+  # enforces the formats.
+  push:
+    branches: [main]
+    tags: ["uat-*", "release-*"]
+
+  # No paths-ignore: the required `checks` job must report on every PR. hotfix/*: the fix PR into a
+  # hotfix branch gets the same CI (and a dev plan).
+  pull_request:
+    branches: [main, "hotfix/**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request' || github.ref_type == 'tag') && 'one' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+# DEMO: same triggers, run titles, environment routing and approval point as neos-ai's main.yml;
+# the build, plan and apply steps only echo.
+jobs:
+  resolve-environment:
+    name: Resolve environment
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - id: resolve
+        env:
+          DISPATCH_ENV: ${{ github.event.inputs.environment }}
+          DISPATCH_APPLY: ${{ github.event.inputs.apply_changes }}
+        run: |
+          ENV="$(.github/scripts/release-tags.sh resolve "$GITHUB_EVENT_NAME" "$GITHUB_REF" "$DISPATCH_ENV" "$DISPATCH_APPLY")" || { echo "$ENV"; exit 1; }
+          echo "Resolved ${GITHUB_EVENT_NAME} on ${GITHUB_REF} → ${ENV}"
+          echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+
+  ci-build:
+    name: CI Build
+    needs: [resolve-environment]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo "lint, test, build Lambda zips (demo)"
+
+  plan:
+    name: Plan (${{ needs.resolve-environment.outputs.environment }})
+    needs: [resolve-environment]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo "tofu plan ${{ needs.resolve-environment.outputs.environment }} (demo)"
+
+  prepare-deploy:
+    name: Upload artifacts (${{ needs.resolve-environment.outputs.environment }})
+    if: >-
+      github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
+      || github.event_name == 'workflow_dispatch' && (inputs.apply_changes == true || inputs.apply_changes == 'true')
+    needs: [resolve-environment, ci-build, plan]
+    environment: ${{ needs.resolve-environment.outputs.environment }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      environment: ${{ needs.resolve-environment.outputs.environment }}
+    steps:
+      - run: echo "upload zips (demo)"
+
+  deploy:
+    name: Apply (${{ needs.prepare-deploy.outputs.environment }})
+    if: ${{ !cancelled() && needs.prepare-deploy.result == 'success' }}
+    needs: [prepare-deploy, resolve-environment]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo "tofu apply ${{ needs.prepare-deploy.outputs.environment }} (demo)"
+
+  github-release:
+    name: GitHub Release
+    if: ${{ !cancelled() && needs.deploy.result == 'success' && needs.resolve-environment.outputs.environment == 'prod' }}
+    needs: [deploy, resolve-environment]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "GitHub Release ${GITHUB_REF_NAME} already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi

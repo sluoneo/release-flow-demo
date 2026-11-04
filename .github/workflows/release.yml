@@ -1,0 +1,129 @@
+# Deploy buttons: tag a commit uat-*/release-* and start main.yml on that tag; hotfix only opens a branch.
+# A GITHUB_TOKEN tag push starts no workflow, so each tag op dispatches main.yml on its new tag.
+# Rollback is not an op here: Actions → Main Workflow → Run workflow on the old release tag (prod, apply).
+name: Release
+run-name: "${{ inputs.op }} ${{ inputs.sha }}${{ inputs.uat_tag }}${{ inputs.release_tag }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        description: "cut-uat: tag a commit for uat | promote-prod: tag a uat tag's commit for prod | hotfix: open a hotfix branch off a release tag"
+        required: true
+        type: choice
+        options: [cut-uat, promote-prod, hotfix]
+      sha:
+        description: "cut-uat: commit to tag (default: main HEAD; a hotfix/* tip also works)"
+        required: false
+        type: string
+      uat_tag:
+        description: "promote-prod: uat tag to release (default: newest)"
+        required: false
+        type: string
+      release_tag:
+        description: "hotfix: the release tag prod runs (required)"
+        required: false
+        type: string
+
+permissions: {}
+
+# Two clicks never compute the same tag; a running op is never cancelled mid-push.
+# GitHub keeps one pending run per group: a third click cancels the queued second (it makes no tag).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: ${{ inputs.op }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag (or the hotfix branch)
+      actions: write # dispatch main.yml on the tag
+    env:
+      OP: ${{ inputs.op }}
+      IN_SHA: ${{ inputs.sha }}
+      IN_UAT_TAG: ${{ inputs.uat_tag }}
+      IN_RELEASE_TAG: ${{ inputs.release_tag }}
+      TAGS: .github/scripts/release-tags.sh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # all tags and branches (cut-uat may take a hotfix/* tip)
+
+      - name: Choose commit and tag
+        id: pick
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          sha_re='^[0-9a-f]{7,40}$'
+          commit_of() { git rev-parse --verify --quiet "$1^{commit}"; }
+          tag_commit() { "$TAGS" valid "$1" "$2" || exit 1; SHA="$(commit_of "refs/tags/$2")" || fail "no tag $2 on origin"; }
+          # A dispatch runs main.yml as of the commit: an older one cannot deploy a tag.
+          taggable() { git cat-file -e "$1:${TAGS}" 2>/dev/null || fail "$1 predates tag deploys: its main.yml cannot deploy a tag"; }
+          [ "$GITHUB_REF" = refs/heads/main ] || fail "run Release from main, not ${GITHUB_REF}"
+          case "$OP" in
+            cut-uat)
+              [ -z "$IN_UAT_TAG$IN_RELEASE_TAG" ] || fail "cut-uat takes only sha"
+              [ -z "$IN_SHA" ] || [[ "$IN_SHA" =~ $sha_re ]] || fail "sha must be 7-40 lowercase hex"
+              SHA="$(commit_of "${IN_SHA:-origin/main}")" || fail "${IN_SHA} is not a commit on origin"
+              KIND=uat
+              ;;
+            promote-prod)
+              [ -z "$IN_SHA$IN_RELEASE_TAG" ] || fail "promote-prod takes only uat_tag"
+              UAT="$IN_UAT_TAG"
+              [ -n "$UAT" ] || UAT="$("$TAGS" newest uat)" || fail "no uat tag on origin"
+              tag_commit uat "$UAT"
+              KIND=release
+              ;;
+            hotfix)
+              [ -z "$IN_SHA$IN_UAT_TAG" ] || fail "hotfix takes only release_tag"
+              [ -n "$IN_RELEASE_TAG" ] || fail "hotfix needs release_tag: the release tag prod runs"
+              tag_commit release "$IN_RELEASE_TAG"
+              taggable "$SHA"
+              BRANCH="hotfix/${IN_RELEASE_TAG}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+              git push origin "${SHA}:refs/heads/${BRANCH}"
+              echo "${OP}: ${BRANCH} at ${SHA}"
+              {
+                echo "## hotfix → \`${BRANCH}\`"
+                echo
+                echo "Branched off \`${IN_RELEASE_TAG}\` (\`${SHA}\`). Next:"
+                echo "1. PR the fix into \`${BRANCH}\` and merge it."
+                echo "2. Release → \`cut-uat\` with sha = the branch tip, then \`promote-prod\`."
+                echo "3. PR \`${BRANCH}\` into \`main\` and merge it with a merge commit."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          taggable "$SHA"
+          TAG="$("$TAGS" next "$KIND")" || { echo "$TAG"; exit 1; }
+          TARGET="$("$TAGS" resolve push "refs/tags/${TAG}" "" "")" || { echo "$TARGET"; exit 1; }
+          echo "${OP}: ${TAG} on ${SHA} -> ${TARGET}"
+          { echo "sha=$SHA"; echo "tag=$TAG"; echo "target=$TARGET"; } >> "$GITHUB_OUTPUT"
+
+      - name: Push tag and start main.yml
+        if: steps.pick.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.pick.outputs.sha }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          TARGET: ${{ steps.pick.outputs.target }}
+        run: |
+          git tag "$TAG" "$SHA"
+          git push origin "refs/tags/${TAG}" # an existing tag is refused, never moved
+          OUT="$(gh workflow run main.yml --ref "$TAG" -f environment="$TARGET" -f apply_changes=true)" || {
+            echo "::error::${TAG} is pushed but main.yml did not start. Do not re-run this op (it would make a new tag): gh workflow run main.yml --ref ${TAG} -f environment=${TARGET} -f apply_changes=true"
+            exit 1; }
+          echo "$OUT"
+          RUN_URL="$(grep -oE 'https://[^ ]+/actions/runs/[0-9]+' <<<"$OUT" | head -1 || true)"
+          RUN_URL="${RUN_URL:-${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/workflows/main.yml}"
+          {
+            echo "## ${OP} → \`${TAG}\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Tag | \`${TAG}\` |"
+            echo "| Commit | \`${SHA}\` |"
+            echo "| Deploys to | ${TARGET} |"
+            echo "| main.yml run | ${RUN_URL} |"
+          } >> "$GITHUB_STEP_SUMMARY"
