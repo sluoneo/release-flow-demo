@@ -1,6 +1,6 @@
 # AutoPilot: PR → CI + dev plan; push to main → CI + dev plan + dev apply. Tag uat-YYYY-MM-DD-N → uat,
 # release-YYYY-MM-DD-N → prod (after approval). Any well-formed tag deploys, old ones too.
-name: Main Workflow
+name: Build and Deploy
 
 # Run title: "<env> · <mode> · <source>", e.g.
 #   dev  · plan (dry-run) 🔍 · PR #123 feat: widget
@@ -63,7 +63,7 @@ concurrency:
 
 permissions: {}
 
-# DEMO: same triggers, run titles, environment routing and approval point as neos-ai's main.yml;
+# DEMO: same triggers, run titles, environment routing and approval point as the real main.yml;
 # the build, plan and apply steps only echo.
 jobs:
   resolve-environment:
